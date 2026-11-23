@@ -1,0 +1,125 @@
+name: Lumora - Build Android APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+concurrency:
+  group: lumora-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-apk:
+    name: Build Lumora APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Find Flutter project
+        run: |
+          PUBSPEC=$(find . -name pubspec.yaml -not -path "./.git/*" | head -n 1)
+          if [ -z "$PUBSPEC" ]; then
+            echo "::error::Repo-te kothao pubspec.yaml nei. Zip file upload hoyeche? Zip khule vitorer file upload korun."
+            echo "Repo files:"
+            find . -not -path "./.git/*" | head -n 50
+            exit 1
+          fi
+          DIR=$(dirname "$PUBSPEC")
+          echo "Project folder: $DIR"
+          echo "PROJECT_DIR=$DIR" >> "$GITHUB_ENV"
+          ls -la "$DIR"
+          test -d "$DIR/lib" || { echo "::error::lib folder nei"; exit 1; }
+          test -d "$DIR/assets" || { echo "::error::assets folder nei"; exit 1; }
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Check tools
+        run: |
+          which flutter dart java
+          flutter --version
+
+      - name: Gradle SDK fix
+        run: |
+          mkdir -p ~/.gradle/init.d
+          cat > ~/.gradle/init.d/force-sdk.gradle <<'EOF'
+          allprojects {
+              tasks.configureEach { t ->
+                  if (t.name.startsWith('lint')) { t.enabled = false }
+              }
+              afterEvaluate { p ->
+                  if (p.hasProperty('android')) {
+                      def a = p.android
+                      try {
+                          def cur = a.compileSdk
+                          if (cur == null || cur < 36) { a.compileSdk = 36 }
+                      } catch (Throwable t) {
+                          println "force-sdk: skipped ${p.name}: ${t.message}"
+                      }
+                  }
+              }
+          }
+          EOF
+
+      - name: Create Android project
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: flutter create --platforms=android --project-name lumora --org com.lumora .
+
+      - name: Patch AndroidManifest
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          M=android/app/src/main/AndroidManifest.xml
+          sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.RECORD_AUDIO"/>\n    <queries><intent><action android:name="android.speech.RecognitionService"/></intent></queries>\n    <application#' $M
+          sed -i 's#android:label="[^"]*"#android:label="Lumora"#' $M
+          sed -i 's#<application#<application android:usesCleartextTraffic="true"#' $M
+          sed -i 's#</application>#<activity android:name="com.linusu.flutter_web_auth_2.CallbackActivity" android:exported="true"><intent-filter android:label="flutter_web_auth_2"><action android:name="android.intent.action.VIEW"/><category android:name="android.intent.category.DEFAULT"/><category android:name="android.intent.category.BROWSABLE"/><data android:scheme="lumora"/></intent-filter></activity>\n    </application>#' $M
+          sed -i 's#<queries>#<queries><intent><action android:name="android.support.customtabs.action.CustomTabsService"/></intent>#' $M
+          cat $M
+
+      - name: Get packages and icons
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          flutter pub get
+          dart run flutter_launcher_icons
+
+      - name: Build release APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: flutter build apk --release 2>&1 | tee build.log
+
+      - name: Show build errors
+        if: failure()
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          grep -nE "error:|Error:|What went wrong|Because " build.log | head -n 15 || true
+          tail -n 40 build.log || true
+
+      - name: Rename APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          VERSION=$(grep '^version:' pubspec.yaml | awk '{print $2}' | cut -d+ -f1)
+          cp build/app/outputs/flutter-apk/app-release.apk "$GITHUB_WORKSPACE/Lumora-v${VERSION}.apk"
+          echo "APK_NAME=Lumora-v${VERSION}.apk" >> "$GITHUB_ENV"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: lumora-apk
+          path: ${{ env.APK_NAME }}
+          retention-days: 30
+          if-no-files-found: error
